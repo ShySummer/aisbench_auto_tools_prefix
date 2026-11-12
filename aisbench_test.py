@@ -10,6 +10,7 @@ from config import *
 from generate_dataset import *
 from save_file import get_data, save_csv, save_log
 from cal_prefix_hit_rate import *
+from prefix_warmup import validate_dp_ranks, warmup_prefixes, wait_for_prefix_metrics
 logging.getLogger().setLevel(logging.INFO)
 
 
@@ -31,12 +32,15 @@ def parse_arguments():
     parser.add_argument("--repeat_rate", type=str, default="0", help="dataset repeat rate")
     parser.add_argument("--prefix_test", action='store_true', default=False, help="test prefix dataset firstly")
     parser.add_argument("--seed", type=int, default=1, help="dataset random seed")
-    parser.add_argument("--dp", type=int, default=1, help="dp size")
+    parser.add_argument("--dp", type=int, default=1, help="actual service DP size; warm each prefix once on ranks 0..dp-1")
     parser.add_argument("--length_mean", type=int, default=None, help="gaussian mean for variable length")
     parser.add_argument("--length_std", type=float, default=None, help="gaussian std for variable length")
     parser.add_argument("--length_min", type=int, default=None, help="min length for uniform range or gaussian clip")
     parser.add_argument("--length_max", type=int, default=None, help="max length for uniform range or gaussian clip")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.dp < 1 or args.prefix_num < 1:
+        parser.error("--dp and --prefix_num must be positive")
+    return args
 
 def symlink_force(target, link_name):
     logging.info(f"make symlink: {link_name} ==> {target}")
@@ -424,24 +428,29 @@ if __name__ == '__main__':
                 pod_info = POD_INFO
             logging.info(f"pod_info: {pod_info}")
             
-            logging.info(f"[开始] 前缀数据集测试")
-            # 前缀测试: request rate 固定为 0
-            warmup_concurrency = prefix_num if dp == 1 else dp
-            modify_aisbench_api(str(warmup_concurrency), "1", request_rate_param="0")
-            dst_file = generate_test_dataset(src_file_prefix, dst_dir)
-
-            # 命中率计算
+            logging.info("[开始] 按 DP rank 定向预热每个前缀")
             query_tokens, query_tokens_external, hit_tokens, hit_tokens_external = get_pod_metrics_info(pod_info)
-
-            subprocess.run(ais_bench_cmd, shell=True, check=True)
-            logging.info(f"[完成] 前缀数据集测试完成，结果保存在aisbench_result.csv")
-
+            if len(pod_info) == 1:
+                validate_dp_ranks(dp, query_tokens.get(pod_info[0], {}))
+            warmup_report = os.path.join(
+                OUTPUT_DIR, "prefix_warmup_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f") + ".json")
+            warmup_generation_kwargs = dict(temperature=0, ignore_eos=True)
+            if enable_think:
+                warmup_generation_kwargs["chat_template_kwargs"] = {"enable_thinking": True}
+            warmup_result = warmup_prefixes(
+                src_file_prefix, dp, prefix_num, host_ip=HOST_IP, host_port=HOST_PORT,
+                model=MODEL_NAME, api_key=API_KEY, url=URL,
+                generation_kwargs=warmup_generation_kwargs, report_path=warmup_report)
+            if len(pod_info) == 1:
+                wait_for_prefix_metrics(
+                    warmup_result, query_tokens[pod_info[0]],
+                    lambda: get_pod_metrics_info(pod_info)[0].get(pod_info[0], {}))
+            logging.info("[完成] 全部 %d 个 DP rank 的 %d 种前缀已预热；明细：%s",
+                         dp, prefix_num, warmup_report)
             query_tokens_new, query_tokens_external_new, hit_tokens_new, hit_tokens_external_new = get_pod_metrics_info(pod_info)
-            cal_prefix_hit_info(query_tokens, query_tokens_external, hit_tokens, hit_tokens_external,query_tokens_new,
-                                query_tokens_external_new, hit_tokens_new, hit_tokens_external_new)
-            
-            # 保存前缀测试结果
-            save_result(0, npu_num, repeat_rate)
+            cal_prefix_hit_info(query_tokens, query_tokens_external, hit_tokens, hit_tokens_external,
+                                query_tokens_new, query_tokens_external_new, hit_tokens_new, hit_tokens_external_new)
+            # Warmup is recorded separately; measured performance starts below.
             logging.info(f"[开始] 全量数据集测试")
             # 命中率计算
             query_tokens, query_tokens_external, hit_tokens, hit_tokens_external = get_pod_metrics_info(pod_info)

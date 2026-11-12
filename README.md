@@ -245,3 +245,20 @@ b. 发送curl命令
 curl -s http://{ip_address}:{port}/metrics | grep prefix
 ```
 正常情况返回vllm:prefix_cache_queries和vllm:prefix_cache_hits信息
+
+
+### DP rank 定向前缀预热
+
+`--dataset_type prefix_cache --prefix_test --dp N` 中的 `N` 必须等于实际服务 DP 数。
+工具将每种前缀分别发送到 rank `0..N-1`，请求头为 `X-data-parallel-rank`，
+每个 `(前缀, rank)` 恰好一条请求，输出长度固定为 1 token。
+例如服务 DP4、`--dp 4 --prefix_num 1` 会发送 4 条定向预热请求；
+`--prefix_num 2` 则发送 8 条。所有预热请求成功完成后才采集正式压测基线并开始压测。
+预热失败或单服务指标中的 engine 集合与 `--dp` 不符时直接停止，不继续正式压测。
+
+预热完成明细保存到 `OUTPUT_DIR/prefix_warmup_*.json`，不混入性能 CSV；
+正式压测仍使用 ais_bench 和自动 DP 负载均衡，不携带固定 rank 请求头。
+端点需要支持 vLLM 的 `X-data-parallel-rank`，经过代理时必须透传该请求头。
+定向完成保证前缀请求到达每个 rank；后续内存压力仍可能驱逐缓存。
+
+单服务场景还会等待各 rank 的前缀查询计数包含全部预热 token，再采集正式基线，避免异步指标把预热量算入正式命中率；超时则停止。
